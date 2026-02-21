@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Python 3.6.8 compatible.
+Queries the Spark History Server REST API to list applications and produces
+a dependency_access CSV with minimal fields for the dependency model:
+  window_start, service, user, do_as, client_ip, app_name, op, object_type, object_id, cnt
+"""
+
+from __future__ import print_function
+
+import argparse
+import csv
+import datetime as dt
+import sys
+import time
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    from requests_kerberos import HTTPKerberosAuth, OPTIONAL as KRB_OPTIONAL
+    HAS_KRB = True
+except ImportError:
+    HAS_KRB = False
+
+
+ACCESS_FIELDS = [
+    "window_start", "service", "user", "do_as", "client_ip",
+    "app_name", "op", "object_type", "object_id", "cnt",
+]
+
+
+def mk_session(auth_mode, user, password, verify_tls):
+    s = requests.Session()
+    s.verify = verify_tls
+    if auth_mode == "basic":
+        if user:
+            s.auth = (user, password)
+    elif auth_mode == "kerberos":
+        if not HAS_KRB:
+            print("ERROR: requests-kerberos not installed.", file=sys.stderr)
+            sys.exit(1)
+        s.auth = HTTPKerberosAuth(mutual_authentication=KRB_OPTIONAL)
+    return s
+
+
+def ts_to_iso(ts_str):
+    """Convert Spark History Server timestamp to ISO format."""
+    if not ts_str:
+        return ""
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fGMT", "%Y-%m-%dT%H:%M:%SGMT",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            parsed = dt.datetime.strptime(ts_str, fmt)
+            return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+    return ts_str[:19] + "Z" if len(ts_str) >= 19 else ts_str
+
+
+def fetch_apps(session, base_url, limit, sleep_ms, since_date, until_date):
+    """Fetch applications from Spark History Server."""
+    url = "{}/api/v1/applications".format(base_url.rstrip("/"))
+    params = {"limit": limit}
+
+    if since_date:
+        params["minDate"] = since_date
+    if until_date:
+        params["maxDate"] = until_date
+
+    all_apps = []
+    offset = 0
+
+    while True:
+        params["offset"] = offset
+        resp = session.get(url, params=params, timeout=120)
+        if not resp.ok:
+            print("ERROR: HTTP {}: {}".format(resp.status_code, resp.text[:2000]), file=sys.stderr)
+            sys.exit(1)
+
+        apps = resp.json()
+        if not isinstance(apps, list) or not apps:
+            break
+
+        all_apps.extend(apps)
+        print("[spark_apps_2_csv] Fetched {} apps so far".format(len(all_apps)), file=sys.stderr)
+
+        if len(apps) < limit:
+            break
+
+        offset += limit
+        time.sleep(sleep_ms / 1000.0)
+
+    return all_apps
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Export Spark History Server applications to dependency_access CSV."
+    )
+    ap.add_argument("--shs-url", required=True,
+                    help="Spark History Server URL (e.g. http://shs-host:18088)")
+    ap.add_argument("--auth-mode", choices=["basic", "kerberos", "none"], default="none",
+                    help="Authentication mode (default: none)")
+    ap.add_argument("--user", default="", help="Username for basic auth")
+    ap.add_argument("--password", default="", help="Password for basic auth")
+    ap.add_argument("--verify-tls", action="store_true", default=False,
+                    help="Verify TLS certificates")
+    ap.add_argument("--since", default=None,
+                    help="Start date YYYYMMDD for minDate filter")
+    ap.add_argument("--until", default=None,
+                    help="End date YYYYMMDD for maxDate filter")
+    ap.add_argument("--last-months", type=int, default=3,
+                    help="If --since/--until not provided, fetch last N months (default: 3)")
+    ap.add_argument("--limit", type=int, default=500,
+                    help="Max apps per API request (default: 500)")
+    ap.add_argument("--sleep-ms", type=int, default=100,
+                    help="Sleep between paginated requests in ms (default: 100)")
+    ap.add_argument("--out-access", default="spark_access.csv",
+                    help="Output CSV path (default: spark_access.csv)")
+    args = ap.parse_args()
+
+    if requests is None:
+        print("ERROR: requests not installed. Run: pip install requests", file=sys.stderr)
+        sys.exit(1)
+
+    session = mk_session(args.auth_mode, args.user, args.password, args.verify_tls)
+
+    since_date = None
+    until_date = None
+    if args.since and args.until:
+        since_date = "{}-{}-{}".format(args.since[:4], args.since[4:6], args.since[6:8])
+        until_date = "{}-{}-{}".format(args.until[:4], args.until[4:6], args.until[6:8])
+    elif not args.since and not args.until:
+        now = dt.datetime.utcnow()
+        since_dt = now - dt.timedelta(days=30 * args.last_months)
+        since_date = since_dt.strftime("%Y-%m-%d")
+    elif args.since or args.until:
+        print("ERROR: Provide both --since and --until, or neither.", file=sys.stderr)
+        sys.exit(1)
+
+    apps = fetch_apps(session, args.shs_url, args.limit, args.sleep_ms, since_date, until_date)
+    print("[spark_apps_2_csv] Total apps fetched: {}".format(len(apps)), file=sys.stderr)
+
+    with open(args.out_access, "w", newline="") as fout:
+        writer = csv.DictWriter(fout, fieldnames=ACCESS_FIELDS)
+        writer.writeheader()
+        for app in apps:
+            attempts = app.get("attempts") or [{}]
+            last_attempt = attempts[-1] if attempts else {}
+            start_time = last_attempt.get("startTime") or ""
+            spark_user = last_attempt.get("sparkUser") or ""
+
+            writer.writerow({
+                "window_start": ts_to_iso(start_time),
+                "service": "spark",
+                "user": spark_user,
+                "do_as": "",
+                "client_ip": "",
+                "app_name": app.get("name") or "",
+                "op": "SUBMIT",
+                "object_type": "application",
+                "object_id": app.get("id") or "",
+                "cnt": 1,
+            })
+
+    print("[spark_apps_2_csv] Wrote {} rows to {}".format(len(apps), args.out_access), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
