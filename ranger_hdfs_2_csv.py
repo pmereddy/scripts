@@ -416,27 +416,43 @@ def make_summary_key(window_start, rec):
     )
 
 
-def update_summary(summary_dict, rec, dedup_minutes):
+def make_dep_key(window_start, rec):
+    return (
+        window_start,
+        rec.get("service", ""),
+        rec.get("user", ""),
+        rec.get("do_as", ""),
+        rec.get("client_ip", ""),
+        rec.get("app_name", ""),
+        rec.get("op", ""),
+        rec.get("resource_norm", ""),
+    )
+
+
+def _update_agg(agg_dict, key, event_ts):
+    agg = agg_dict.get(key)
+    if agg is None:
+        agg_dict[key] = {"first_seen": event_ts, "last_seen": event_ts, "cnt": 1}
+    else:
+        if event_ts and (not agg["first_seen"] or event_ts < agg["first_seen"]):
+            agg["first_seen"] = event_ts
+        if event_ts and (not agg["last_seen"] or event_ts > agg["last_seen"]):
+            agg["last_seen"] = event_ts
+        agg["cnt"] += 1
+
+
+def update_summary(summary_dict, rec, dedup_minutes, dep_dict=None):
     ts = parse_ts_utc_z(rec.get("event_ts", ""))
     window_start = ""
     if ts is not None:
         window_start = floor_time_to_window(ts, dedup_minutes).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     k = make_summary_key(window_start, rec)
-    agg = summary_dict.get(k)
-    if agg is None:
-        summary_dict[k] = {
-            "first_seen": rec.get("event_ts", ""),
-            "last_seen": rec.get("event_ts", ""),
-            "cnt": 1
-        }
-    else:
-        et = rec.get("event_ts", "")
-        if et and (not agg["first_seen"] or et < agg["first_seen"]):
-            agg["first_seen"] = et
-        if et and (not agg["last_seen"] or et > agg["last_seen"]):
-            agg["last_seen"] = et
-        agg["cnt"] += 1
+    _update_agg(summary_dict, k, rec.get("event_ts", ""))
+
+    if dep_dict is not None:
+        dk = make_dep_key(window_start, rec)
+        _update_agg(dep_dict, dk, rec.get("event_ts", ""))
 
 
 # -------------------------
@@ -455,6 +471,28 @@ SUMMARY_FIELDS = [
     "first_seen", "last_seen", "cnt",
 ]
 
+DEPENDENCY_ACCESS_FIELDS = [
+    "window_start", "service", "user", "do_as", "client_ip",
+    "app_name", "op", "object_type", "object_id", "cnt",
+]
+
+SERVICE_TO_OBJECT_TYPE = {
+    "hdfs": "hdfs_path",
+    "hive": "hive_table",
+    "kudu": "kudu_table",
+    "impala": "hive_table",
+    "yarn": "application",
+    "spark": "application",
+}
+
+
+def infer_object_type(service_name):
+    svc = (service_name or "").lower()
+    for key, otype in SERVICE_TO_OBJECT_TYPE.items():
+        if key in svc:
+            return otype
+    return "unknown"
+
 
 def writer_thread_fn(q, out_events_path, stop_evt):
     with open(out_events_path, "w") as f:
@@ -469,9 +507,24 @@ def writer_thread_fn(q, out_events_path, stop_evt):
             q.task_done()
 
 
+def _merge_agg_dicts(target, source):
+    for k, agg in source.items():
+        g = target.get(k)
+        if g is None:
+            target[k] = agg
+        else:
+            if agg["first_seen"] and (not g["first_seen"] or agg["first_seen"] < g["first_seen"]):
+                g["first_seen"] = agg["first_seen"]
+            if agg["last_seen"] and (not g["last_seen"] or agg["last_seen"] > g["last_seen"]):
+                g["last_seen"] = agg["last_seen"]
+            g["cnt"] += agg["cnt"]
+
+
 def process_file(file_path, event_q, summary_global, summary_lock,
-                 dedup_minutes, progress, progress_lock, skip_nonjson):
+                 dedup_minutes, progress, progress_lock, skip_nonjson,
+                 dep_global=None):
     local_summary = {}
+    local_dep = {} if dep_global is not None else None
 
     for line in hdfs_stream_text(file_path):
         line_s = line.strip()
@@ -494,7 +547,7 @@ def process_file(file_path, event_q, summary_global, summary_lock,
             continue
 
         event_q.put(rec)
-        update_summary(local_summary, rec, dedup_minutes)
+        update_summary(local_summary, rec, dedup_minutes, dep_dict=local_dep)
 
         with progress_lock:
             progress["events"] += 1
@@ -504,16 +557,9 @@ def process_file(file_path, event_q, summary_global, summary_lock,
                 ), file=sys.stderr)
 
     with summary_lock:
-        for k, agg in local_summary.items():
-            g = summary_global.get(k)
-            if g is None:
-                summary_global[k] = agg
-            else:
-                if agg["first_seen"] and (not g["first_seen"] or agg["first_seen"] < g["first_seen"]):
-                    g["first_seen"] = agg["first_seen"]
-                if agg["last_seen"] and (not g["last_seen"] or agg["last_seen"] > g["last_seen"]):
-                    g["last_seen"] = agg["last_seen"]
-                g["cnt"] += agg["cnt"]
+        _merge_agg_dicts(summary_global, local_summary)
+        if dep_global is not None and local_dep is not None:
+            _merge_agg_dicts(dep_global, local_dep)
 
 
 def write_summary_csv(summary, out_summary_path):
@@ -539,12 +585,38 @@ def write_summary_csv(summary, out_summary_path):
             })
 
 
+def write_dependency_csv(dep_dict, out_path):
+    with open(out_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=DEPENDENCY_ACCESS_FIELDS)
+        w.writeheader()
+        for k in sorted(dep_dict.keys()):
+            agg = dep_dict[k]
+            service_raw = k[1]
+            w.writerow({
+                "window_start": k[0],
+                "service": service_raw,
+                "user": k[2],
+                "do_as": k[3],
+                "client_ip": k[4],
+                "app_name": k[5],
+                "op": k[6],
+                "object_type": infer_object_type(service_raw),
+                "object_id": k[7],
+                "cnt": agg.get("cnt", 0),
+            })
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Process Ranger audit logs from HDFS into events, summary, and dependency CSVs."
+    )
     ap.add_argument("--hdfs-root", required=True, help="HDFS audit root, e.g. hdfs:///ranger/audit")
     ap.add_argument("--out-events", required=True, help="Local output CSV path for per-event records")
     ap.add_argument("--out-summary", required=True, help="Local output CSV path for dedup summary")
-    ap.add_argument("--threads", type=int, default=8, help="Parallel threads across HDFS files")
+    ap.add_argument("--out-dependency", default=None,
+                    help="Optional: output CSV path for common-schema dependency_access (minimal fields)")
+    ap.add_argument("--threads", type=int, default=8,
+                    help="Parallel threads across HDFS files (production: start with 2-4)")
     ap.add_argument("--dedup-minutes", type=int, default=30, help="Dedup window minutes for summary tier")
 
     # Date control (folder-based)
@@ -598,6 +670,7 @@ def main():
 
     # Shared summary dict + locks
     summary_global = {}
+    dep_global = {} if args.out_dependency else None
     summary_lock = threading.Lock()
 
     # Writer queue + thread
@@ -625,7 +698,8 @@ def main():
                     args.dedup_minutes,
                     progress,
                     progress_lock,
-                    args.skip_nonjson
+                    args.skip_nonjson,
+                    dep_global,
                 ))
             for fut in as_completed(futures):
                 fut.result()
@@ -638,6 +712,11 @@ def main():
 
         print("Writing summary CSV to {} (rows={:,})".format(args.out_summary, len(summary_global)), file=sys.stderr)
         write_summary_csv(summary_global, args.out_summary)
+
+        if args.out_dependency and dep_global is not None:
+            print("Writing dependency CSV to {} (rows={:,})".format(
+                args.out_dependency, len(dep_global)), file=sys.stderr)
+            write_dependency_csv(dep_global, args.out_dependency)
 
         print("Done.\n  files={}\n  events={:,}\n  filtered={:,}\n  bad_json={:,}\n  events_csv={}\n  summary_csv={}".format(
             len(files), progress["events"], progress["filtered"], progress["bad_json"], args.out_events, args.out_summary
