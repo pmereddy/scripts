@@ -12,6 +12,7 @@ from __future__ import print_function
 import argparse
 import csv
 import datetime as dt
+import os
 import sys
 import time
 
@@ -62,20 +63,24 @@ def ts_to_iso(ts_str):
 
 
 def fetch_apps(session, base_url, limit, sleep_ms, since_date, until_date):
-    """Fetch applications from Spark History Server."""
+    """Fetch applications from Spark History Server with offset-based pagination.
+
+    The SHS API supports `?start=N&limit=M` for pagination and returns a JSON
+    array.  We deduplicate by application ID to guard against edge cases.
+    """
     url = "{}/api/v1/applications".format(base_url.rstrip("/"))
-    params = {"limit": limit}
-
-    if since_date:
-        params["minDate"] = since_date
-    if until_date:
-        params["maxDate"] = until_date
-
+    seen_ids = set()
     all_apps = []
-    offset = 0
+    start = 0
+    page = 0
 
     while True:
-        params["offset"] = offset
+        params = {"limit": limit, "start": start}
+        if since_date:
+            params["minDate"] = since_date
+        if until_date:
+            params["maxDate"] = until_date
+
         resp = session.get(url, params=params, timeout=120)
         if not resp.ok:
             print("ERROR: HTTP {}: {}".format(resp.status_code, resp.text[:2000]), file=sys.stderr)
@@ -85,13 +90,27 @@ def fetch_apps(session, base_url, limit, sleep_ms, since_date, until_date):
         if not isinstance(apps, list) or not apps:
             break
 
-        all_apps.extend(apps)
-        print("[spark_apps_2_csv] Fetched {} apps so far".format(len(all_apps)), file=sys.stderr)
+        new_count = 0
+        for app in apps:
+            app_id = app.get("id")
+            if app_id and app_id not in seen_ids:
+                seen_ids.add(app_id)
+                all_apps.append(app)
+                new_count += 1
+
+        page += 1
+        print("[spark] page {} fetched={} new={} total={} start={}".format(
+            page, len(apps), new_count, len(all_apps), start
+        ), file=sys.stderr)
 
         if len(apps) < limit:
             break
 
-        offset += limit
+        if new_count == 0:
+            print("[spark] WARNING: no new apps in page, stopping.", file=sys.stderr)
+            break
+
+        start += limit
         time.sleep(sleep_ms / 1000.0)
 
     return all_apps
@@ -142,8 +161,16 @@ def main():
         print("ERROR: Provide both --since and --until, or neither.", file=sys.stderr)
         sys.exit(1)
 
+    print("[spark] Date range: {} to {}".format(
+        since_date or "open", until_date or "open"
+    ), file=sys.stderr)
+
     apps = fetch_apps(session, args.shs_url, args.limit, args.sleep_ms, since_date, until_date)
-    print("[spark_apps_2_csv] Total apps fetched: {}".format(len(apps)), file=sys.stderr)
+    print("[spark] Total unique apps fetched: {}".format(len(apps)), file=sys.stderr)
+
+    out_dir = os.path.dirname(os.path.abspath(args.out_access))
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
 
     with open(args.out_access, "w", newline="") as fout:
         writer = csv.DictWriter(fout, fieldnames=ACCESS_FIELDS)
@@ -167,7 +194,7 @@ def main():
                 "cnt": 1,
             })
 
-    print("[spark_apps_2_csv] Wrote {} rows to {}".format(len(apps), args.out_access), file=sys.stderr)
+    print("[spark] Wrote {} rows to {}".format(len(apps), args.out_access), file=sys.stderr)
 
 
 if __name__ == "__main__":
