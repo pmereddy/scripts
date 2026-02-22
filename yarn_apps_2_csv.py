@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Python 3.6.8 compatible.
-Queries the YARN ResourceManager REST API to list applications and produces
-a dependency_access CSV with minimal fields for the dependency model:
-  window_start, service, user, do_as, client_ip, app_name, op, object_type, object_id, cnt
+Queries the YARN ResourceManager and/or Job History Server REST APIs to list
+applications and produces a dependency_access CSV.
+
+The RM only retains recently completed apps in memory; the JHS stores the full
+history of completed MapReduce/Tez jobs.  Use both for complete coverage.
 """
 
 from __future__ import print_function
@@ -72,16 +74,15 @@ def ms_to_date_str(epoch_ms):
         return "?"
 
 
-def fetch_apps(session, base_url, states, started_begin, started_end, limit, sleep_ms):
-    """Paginate through RM apps endpoint using time-cursor advancement.
+# ---------------------------------------------------------------------------
+# ResourceManager fetcher
+# ---------------------------------------------------------------------------
 
-    The YARN RM API does not guarantee result ordering or provide a cursor.
-    We sort each batch by startedTime, advance the cursor past the max
-    timestamp seen (+1 ms), and deduplicate by application ID.
-    """
+def fetch_rm_apps(session, rm_url, states, started_begin, started_end, limit, sleep_ms):
+    """Paginate through RM /ws/v1/cluster/apps using time-cursor advancement."""
     seen_ids = set()
     all_apps = []
-    url = "{}/ws/v1/cluster/apps".format(base_url.rstrip("/"))
+    url = "{}/ws/v1/cluster/apps".format(rm_url.rstrip("/"))
     cursor = started_begin
 
     page = 0
@@ -96,8 +97,8 @@ def fetch_apps(session, base_url, states, started_begin, started_end, limit, sle
 
         resp = session.get(url, params=params, timeout=120)
         if not resp.ok:
-            print("ERROR: HTTP {}: {}".format(resp.status_code, resp.text[:2000]), file=sys.stderr)
-            sys.exit(1)
+            print("[yarn-rm] ERROR: HTTP {}: {}".format(resp.status_code, resp.text[:2000]), file=sys.stderr)
+            break
 
         data = resp.json()
         apps_wrapper = data.get("apps") or {}
@@ -118,22 +119,20 @@ def fetch_apps(session, base_url, states, started_begin, started_end, limit, sle
                 max_ts = ts
 
         page += 1
-        print("[yarn] page {} fetched={} new={} total={} cursor={}".format(
+        print("[yarn-rm] page {} fetched={} new={} total={} cursor={}".format(
             page, len(apps), new_count, len(all_apps),
             ms_to_date_str(cursor) if cursor else "start"
         ), file=sys.stderr)
 
         if len(apps) < limit:
             break
-
         if max_ts is None:
             break
 
         next_cursor = max_ts + 1
         if cursor is not None and next_cursor <= cursor:
-            print("[yarn] WARNING: cursor did not advance (all apps at same ms). "
+            print("[yarn-rm] WARNING: cursor did not advance. "
                   "Increasing limit for this window.", file=sys.stderr)
-            cursor = None
             params_retry = {"limit": limit * 10}
             if states:
                 params_retry["states"] = states
@@ -142,8 +141,7 @@ def fetch_apps(session, base_url, states, started_begin, started_end, limit, sle
                 params_retry["startedTimeEnd"] = max_ts + 1000
             resp2 = session.get(url, params=params_retry, timeout=120)
             if resp2.ok:
-                data2 = resp2.json()
-                apps2 = (data2.get("apps") or {}).get("app") or []
+                apps2 = (resp2.json().get("apps") or {}).get("app") or []
                 for app in apps2:
                     app_id = app.get("id")
                     if app_id and app_id not in seen_ids:
@@ -157,15 +155,93 @@ def fetch_apps(session, base_url, states, started_begin, started_end, limit, sle
 
         time.sleep(sleep_ms / 1000.0)
 
-    return all_apps
+    return all_apps, seen_ids
+
+
+# ---------------------------------------------------------------------------
+# Job History Server fetcher
+# ---------------------------------------------------------------------------
+
+def fetch_jhs_jobs(session, jhs_url, started_begin, started_end, limit, sleep_ms,
+                   already_seen):
+    """Paginate through JHS /ws/v1/history/mapreduce/jobs using time-cursor.
+
+    The JHS API uses the same startedTimeBegin/startedTimeEnd filters as RM
+    but wraps results differently: {"jobs": {"job": [...]}}.
+    Job IDs (job_xxx) are converted to application IDs (application_xxx) so
+    they can be deduplicated against RM results.
+    """
+    seen_ids = set(already_seen)
+    all_jobs = []
+    url = "{}/ws/v1/history/mapreduce/jobs".format(jhs_url.rstrip("/"))
+    cursor = started_begin
+
+    page = 0
+    while True:
+        params = {"limit": limit}
+        if cursor:
+            params["startedTimeBegin"] = cursor
+        if started_end:
+            params["startedTimeEnd"] = started_end
+
+        resp = session.get(url, params=params, timeout=120)
+        if not resp.ok:
+            print("[yarn-jhs] ERROR: HTTP {}: {}".format(resp.status_code, resp.text[:2000]), file=sys.stderr)
+            break
+
+        data = resp.json()
+        jobs_wrapper = data.get("jobs") or {}
+        jobs = jobs_wrapper.get("job") or []
+        if not jobs:
+            break
+
+        new_count = 0
+        max_ts = None
+        for job in jobs:
+            job_id = job.get("id") or ""
+            app_id = job_id.replace("job_", "application_", 1) if job_id.startswith("job_") else job_id
+            if app_id and app_id not in seen_ids:
+                seen_ids.add(app_id)
+                job["_app_id"] = app_id
+                all_jobs.append(job)
+                new_count += 1
+            ts = job.get("startTime") or job.get("submitTime")
+            if ts and (max_ts is None or ts > max_ts):
+                max_ts = ts
+
+        page += 1
+        print("[yarn-jhs] page {} fetched={} new={} total={} cursor={}".format(
+            page, len(jobs), new_count, len(all_jobs),
+            ms_to_date_str(cursor) if cursor else "start"
+        ), file=sys.stderr)
+
+        if len(jobs) < limit:
+            break
+        if max_ts is None:
+            break
+
+        next_cursor = max_ts + 1
+        if cursor is not None and next_cursor <= cursor:
+            next_cursor = max_ts + 1001
+        cursor = next_cursor
+        if started_end and cursor >= started_end:
+            break
+
+        time.sleep(sleep_ms / 1000.0)
+
+    return all_jobs
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Export YARN applications to dependency_access CSV."
+        description="Export YARN applications to dependency_access CSV.  "
+                    "Queries the ResourceManager and optionally the Job History Server."
     )
-    ap.add_argument("--rm-url", required=True,
+    ap.add_argument("--rm-url", default=None,
                     help="YARN ResourceManager URL (e.g. http://rm-host:8088)")
+    ap.add_argument("--jhs-url", default=None,
+                    help="YARN Job History Server URL (e.g. http://jhs-host:19888). "
+                         "Provides completed MR/Tez jobs beyond what the RM retains.")
     ap.add_argument("--auth-mode", choices=["basic", "kerberos", "none"], default="none",
                     help="Authentication mode (default: none)")
     ap.add_argument("--user", default="", help="Username for basic auth")
@@ -173,7 +249,7 @@ def main():
     ap.add_argument("--verify-tls", action="store_true", default=False,
                     help="Verify TLS certificates")
     ap.add_argument("--states", default="FINISHED,KILLED,FAILED,RUNNING",
-                    help="Comma-separated app states to fetch (default: FINISHED,KILLED,FAILED,RUNNING)")
+                    help="App states to fetch from RM (default: FINISHED,KILLED,FAILED,RUNNING)")
     ap.add_argument("--since", default=None,
                     help="Start date YYYYMMDD for startedTimeBegin filter")
     ap.add_argument("--until", default=None,
@@ -187,6 +263,9 @@ def main():
     ap.add_argument("--out-access", default="yarn_access.csv",
                     help="Output CSV path (default: yarn_access.csv)")
     args = ap.parse_args()
+
+    if not args.rm_url and not args.jhs_url:
+        ap.error("At least one of --rm-url or --jhs-url is required.")
 
     if requests is None:
         print("ERROR: requests not installed. Run: pip install requests", file=sys.stderr)
@@ -212,9 +291,27 @@ def main():
         ms_to_date_str(started_end) if started_end else "open"
     ), file=sys.stderr)
 
-    apps = fetch_apps(session, args.rm_url, args.states, started_begin, started_end,
-                      args.limit, args.sleep_ms)
-    print("[yarn] Total unique apps fetched: {}".format(len(apps)), file=sys.stderr)
+    # -- Fetch from RM --
+    rm_apps = []
+    seen_ids = set()
+    if args.rm_url:
+        rm_apps, seen_ids = fetch_rm_apps(
+            session, args.rm_url, args.states, started_begin, started_end,
+            args.limit, args.sleep_ms)
+        print("[yarn-rm] {} unique apps from ResourceManager".format(len(rm_apps)), file=sys.stderr)
+
+    # -- Fetch from JHS --
+    jhs_jobs = []
+    if args.jhs_url:
+        jhs_jobs = fetch_jhs_jobs(
+            session, args.jhs_url, started_begin, started_end,
+            args.limit, args.sleep_ms, seen_ids)
+        print("[yarn-jhs] {} unique jobs from Job History Server (after dedup vs RM)".format(
+            len(jhs_jobs)), file=sys.stderr)
+
+    total = len(rm_apps) + len(jhs_jobs)
+    print("[yarn] Total unique entries: {} (RM={}, JHS={})".format(
+        total, len(rm_apps), len(jhs_jobs)), file=sys.stderr)
 
     out_dir = os.path.dirname(os.path.abspath(args.out_access))
     if out_dir and not os.path.exists(out_dir):
@@ -223,10 +320,10 @@ def main():
     with open(args.out_access, "w", newline="") as fout:
         writer = csv.DictWriter(fout, fieldnames=ACCESS_FIELDS)
         writer.writeheader()
-        for app in apps:
-            start_iso = ts_to_iso(app.get("startedTime"))
+
+        for app in rm_apps:
             writer.writerow({
-                "window_start": start_iso,
+                "window_start": ts_to_iso(app.get("startedTime")),
                 "service": "yarn",
                 "user": app.get("user") or "",
                 "do_as": "",
@@ -238,7 +335,22 @@ def main():
                 "cnt": 1,
             })
 
-    print("[yarn] Wrote {} rows to {}".format(len(apps), args.out_access), file=sys.stderr)
+        for job in jhs_jobs:
+            start_ts = job.get("startTime") or job.get("submitTime")
+            writer.writerow({
+                "window_start": ts_to_iso(start_ts),
+                "service": "yarn",
+                "user": job.get("user") or "",
+                "do_as": "",
+                "client_ip": "",
+                "app_name": job.get("name") or "",
+                "op": "SUBMIT",
+                "object_type": "application",
+                "object_id": job.get("_app_id") or "",
+                "cnt": 1,
+            })
+
+    print("[yarn] Wrote {} rows to {}".format(total, args.out_access), file=sys.stderr)
 
 
 if __name__ == "__main__":
