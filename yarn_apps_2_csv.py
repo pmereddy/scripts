@@ -10,6 +10,7 @@ a dependency_access CSV with minimal fields for the dependency model:
 from __future__ import print_function
 
 import argparse
+import calendar
 import csv
 import datetime as dt
 import os
@@ -48,6 +49,12 @@ def mk_session(auth_mode, user, password, verify_tls):
     return s
 
 
+def utc_date_to_epoch_ms(date_str):
+    """Convert YYYYMMDD string to epoch milliseconds (UTC)."""
+    t = dt.datetime.strptime(date_str, "%Y%m%d")
+    return calendar.timegm(t.timetuple()) * 1000
+
+
 def ts_to_iso(epoch_ms):
     if not epoch_ms:
         return ""
@@ -57,20 +64,36 @@ def ts_to_iso(epoch_ms):
         return ""
 
 
+def ms_to_date_str(epoch_ms):
+    """Convert epoch ms to YYYY-MM-DD for progress display."""
+    try:
+        return dt.datetime.utcfromtimestamp(epoch_ms / 1000.0).strftime("%Y-%m-%d")
+    except Exception:
+        return "?"
+
+
 def fetch_apps(session, base_url, states, started_begin, started_end, limit, sleep_ms):
-    """Paginate through RM apps endpoint."""
+    """Paginate through RM apps endpoint using time-cursor advancement.
+
+    The YARN RM API does not guarantee result ordering or provide a cursor.
+    We sort each batch by startedTime, advance the cursor past the max
+    timestamp seen (+1 ms), and deduplicate by application ID.
+    """
+    seen_ids = set()
     all_apps = []
-    params = {"limit": limit}
-    if states:
-        params["states"] = states
-    if started_begin:
-        params["startedTimeBegin"] = started_begin
-    if started_end:
-        params["startedTimeEnd"] = started_end
-
     url = "{}/ws/v1/cluster/apps".format(base_url.rstrip("/"))
+    cursor = started_begin
 
+    page = 0
     while True:
+        params = {"limit": limit}
+        if states:
+            params["states"] = states
+        if cursor:
+            params["startedTimeBegin"] = cursor
+        if started_end:
+            params["startedTimeEnd"] = started_end
+
         resp = session.get(url, params=params, timeout=120)
         if not resp.ok:
             print("ERROR: HTTP {}: {}".format(resp.status_code, resp.text[:2000]), file=sys.stderr)
@@ -82,16 +105,54 @@ def fetch_apps(session, base_url, states, started_begin, started_end, limit, sle
         if not apps:
             break
 
-        all_apps.extend(apps)
-        print("[yarn_apps_2_csv] Fetched {} apps so far".format(len(all_apps)), file=sys.stderr)
+        new_count = 0
+        max_ts = None
+        for app in apps:
+            app_id = app.get("id")
+            if app_id and app_id not in seen_ids:
+                seen_ids.add(app_id)
+                all_apps.append(app)
+                new_count += 1
+            ts = app.get("startedTime")
+            if ts and (max_ts is None or ts > max_ts):
+                max_ts = ts
+
+        page += 1
+        print("[yarn] page {} fetched={} new={} total={} cursor={}".format(
+            page, len(apps), new_count, len(all_apps),
+            ms_to_date_str(cursor) if cursor else "start"
+        ), file=sys.stderr)
 
         if len(apps) < limit:
             break
 
-        last_ts = apps[-1].get("startedTime")
-        if last_ts:
-            params["startedTimeBegin"] = last_ts
-        else:
+        if max_ts is None:
+            break
+
+        next_cursor = max_ts + 1
+        if cursor is not None and next_cursor <= cursor:
+            print("[yarn] WARNING: cursor did not advance (all apps at same ms). "
+                  "Increasing limit for this window.", file=sys.stderr)
+            cursor = None
+            params_retry = {"limit": limit * 10}
+            if states:
+                params_retry["states"] = states
+            params_retry["startedTimeBegin"] = max_ts
+            if started_end:
+                params_retry["startedTimeEnd"] = max_ts + 1000
+            resp2 = session.get(url, params=params_retry, timeout=120)
+            if resp2.ok:
+                data2 = resp2.json()
+                apps2 = (data2.get("apps") or {}).get("app") or []
+                for app in apps2:
+                    app_id = app.get("id")
+                    if app_id and app_id not in seen_ids:
+                        seen_ids.add(app_id)
+                        all_apps.append(app)
+            next_cursor = max_ts + 1001
+
+        cursor = next_cursor
+        if started_end and cursor >= started_end:
             break
 
         time.sleep(sleep_ms / 1000.0)
@@ -136,19 +197,28 @@ def main():
     started_begin = None
     started_end = None
     if args.since and args.until:
-        started_begin = int(dt.datetime.strptime(args.since, "%Y%m%d").strftime("%s")) * 1000
-        started_end = int(dt.datetime.strptime(args.until, "%Y%m%d").strftime("%s")) * 1000
+        started_begin = utc_date_to_epoch_ms(args.since)
+        started_end = utc_date_to_epoch_ms(args.until)
     elif not args.since and not args.until:
         now = dt.datetime.utcnow()
         since = now - dt.timedelta(days=30 * args.last_months)
-        started_begin = int(time.mktime(since.timetuple())) * 1000
+        started_begin = calendar.timegm(since.timetuple()) * 1000
     elif args.since or args.until:
         print("ERROR: Provide both --since and --until, or neither.", file=sys.stderr)
         sys.exit(1)
 
+    print("[yarn] Date range: {} to {}".format(
+        ms_to_date_str(started_begin) if started_begin else "open",
+        ms_to_date_str(started_end) if started_end else "open"
+    ), file=sys.stderr)
+
     apps = fetch_apps(session, args.rm_url, args.states, started_begin, started_end,
                       args.limit, args.sleep_ms)
-    print("[yarn_apps_2_csv] Total apps fetched: {}".format(len(apps)), file=sys.stderr)
+    print("[yarn] Total unique apps fetched: {}".format(len(apps)), file=sys.stderr)
+
+    out_dir = os.path.dirname(os.path.abspath(args.out_access))
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
 
     with open(args.out_access, "w", newline="") as fout:
         writer = csv.DictWriter(fout, fieldnames=ACCESS_FIELDS)
@@ -168,7 +238,7 @@ def main():
                 "cnt": 1,
             })
 
-    print("[yarn_apps_2_csv] Wrote {} rows to {}".format(len(apps), args.out_access), file=sys.stderr)
+    print("[yarn] Wrote {} rows to {}".format(len(apps), args.out_access), file=sys.stderr)
 
 
 if __name__ == "__main__":
