@@ -5,8 +5,10 @@
 Python 3.6 compatible.
 Reads Ranger audit logs directly from HDFS (Kerberos ticket required), filters noise,
 reduces file path to directory level (one level above), and produces:
-  (a) events CSV (all non-filtered events)
-  (b) summary CSV (graph-ready, 30-min dedup window by default)
+  (a) events CSV   -- all non-filtered events (optional; skip with --skip-events)
+  (b) summary CSV  -- graph-ready, 30-min dedup window by default
+  (c) dependency CSV -- compact common-schema output for dependency modeling
+       with configurable resource depth, time window, and key dimensions
 
 Supports directory layouts:
   A) /ranger/audit/<service>/<YYYYMMDD>/...
@@ -57,6 +59,8 @@ NOISE_REGEX = [
 NOISE_FILENAMES = set(["_SUCCESS"])
 
 DATE_DIR_RE = re.compile(r"/(\d{8})(?:/)?$")
+
+FILTER_OPS_DEFAULT = "getfileinfo,liststatus,getfilestatus"
 
 
 # -------------------------
@@ -156,7 +160,6 @@ def list_date_dirs_for_service(service_dir, since, until):
       A) /ranger/audit/<service>/<YYYYMMDD>/
       B) /ranger/audit/<service>/<service>/<YYYYMMDD>/
     """
-    # list children of /ranger/audit/<service>
     lines = hdfs_ls(service_dir)
     child_dirs = []
     for line in lines:
@@ -165,7 +168,6 @@ def list_date_dirs_for_service(service_dir, since, until):
             continue
         child_dirs.append(parts[-1])
 
-    # Try layout A first
     keep = []
     for p in child_dirs:
         m = DATE_DIR_RE.search(p)
@@ -177,7 +179,6 @@ def list_date_dirs_for_service(service_dir, since, until):
     if keep:
         return keep
 
-    # Fallback to layout B: find inner folder matching service name
     outer = os.path.basename(service_dir.rstrip("/"))
     inner_dir = None
     for p in child_dirs:
@@ -233,7 +234,7 @@ def safe_str(x, max_len=4000):
         return ""
     s = str(x)
     if len(s) > max_len:
-        return s[:max_len] + "…"
+        return s[:max_len]
     return s
 
 
@@ -305,6 +306,19 @@ def reduce_to_directory_level(path):
     return parent or ""
 
 
+def truncate_path(file_path, depth):
+    """Truncate path to the given directory depth.
+    depth=3: /user/spark/data/2024/01/file.parquet -> /user/spark/data/
+    """
+    if not file_path:
+        return ""
+    parts = file_path.strip("/").split("/")
+    kept = parts[:depth]
+    if not kept:
+        return "/"
+    return "/" + "/".join(kept) + "/"
+
+
 def normalize_result(result):
     if result is None:
         return ""
@@ -325,7 +339,6 @@ def parse_audit(obj, source_file):
     service = safe_str(extract_first(obj, ["repoName", "repositoryName", "serviceName", "repo"]), 256)
     user = safe_str(extract_first(obj, ["user", "reqUser", "accessUser"]), 256)
 
-    # Keep doAs + ugi
     do_as = safe_str(extract_first(obj, ["doAsUser", "proxyUser", "impersonator", "proxy"]), 256)
     ugi = safe_str(extract_first(obj, ["ugi", "userGroupInformation"]), 512)
 
@@ -394,9 +407,24 @@ def parse_ts_utc_z(ts):
 
 
 def floor_time_to_window(ts, minutes):
-    # ts is datetime (naive UTC), floor to window
     discard = ts.minute % minutes
     return ts.replace(minute=ts.minute - discard, second=0, microsecond=0)
+
+
+def floor_dep_window(ts, dep_window):
+    """Floor a datetime to the dependency time window granularity."""
+    if dep_window == "none":
+        return ""
+    if dep_window == "daily":
+        return ts.strftime("%Y-%m-%d")
+    if dep_window == "monthly":
+        return ts.strftime("%Y-%m")
+    if dep_window == "1h":
+        return ts.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if dep_window == "6h":
+        h = ts.hour - (ts.hour % 6)
+        return ts.replace(hour=h, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # -------------------------
@@ -416,17 +444,24 @@ def make_summary_key(window_start, rec):
     )
 
 
-def make_dep_key(window_start, rec):
-    return (
+def make_dep_key(window_start, rec, resource_depth, include_ip, include_app):
+    object_id = rec.get("resource_norm", "")
+    if resource_depth is not None:
+        object_id = truncate_path(object_id, resource_depth)
+
+    key = [
         window_start,
         rec.get("service", ""),
         rec.get("user", ""),
         rec.get("do_as", ""),
-        rec.get("client_ip", ""),
-        rec.get("app_name", ""),
         rec.get("op", ""),
-        rec.get("resource_norm", ""),
-    )
+        object_id,
+    ]
+    if include_ip:
+        key.append(rec.get("client_ip", ""))
+    if include_app:
+        key.append(rec.get("app_name", ""))
+    return tuple(key)
 
 
 def _update_agg(agg_dict, key, event_ts):
@@ -441,7 +476,28 @@ def _update_agg(agg_dict, key, event_ts):
         agg["cnt"] += 1
 
 
-def update_summary(summary_dict, rec, dedup_minutes, dep_dict=None):
+def _update_dep_agg(agg_dict, key, event_ts, rec, include_ip, include_app):
+    """Like _update_agg but also tracks sample values for non-key fields."""
+    agg = agg_dict.get(key)
+    if agg is None:
+        agg_dict[key] = {
+            "first_seen": event_ts,
+            "last_seen": event_ts,
+            "cnt": 1,
+            "sample_ip": rec.get("client_ip", "") if not include_ip else "",
+            "sample_app": rec.get("app_name", "") if not include_app else "",
+        }
+    else:
+        if event_ts and (not agg["first_seen"] or event_ts < agg["first_seen"]):
+            agg["first_seen"] = event_ts
+        if event_ts and (not agg["last_seen"] or event_ts > agg["last_seen"]):
+            agg["last_seen"] = event_ts
+        agg["cnt"] += 1
+
+
+def update_summary(summary_dict, rec, dedup_minutes,
+                   dep_dict=None, dep_window="daily", resource_depth=None,
+                   include_ip=False, include_app=False, filter_ops_set=None):
     ts = parse_ts_utc_z(rec.get("event_ts", ""))
     window_start = ""
     if ts is not None:
@@ -451,8 +507,15 @@ def update_summary(summary_dict, rec, dedup_minutes, dep_dict=None):
     _update_agg(summary_dict, k, rec.get("event_ts", ""))
 
     if dep_dict is not None:
-        dk = make_dep_key(window_start, rec)
-        _update_agg(dep_dict, dk, rec.get("event_ts", ""))
+        if filter_ops_set and rec.get("access_type", "").lower().strip() in filter_ops_set:
+            return
+
+        dep_ws = ""
+        if ts is not None:
+            dep_ws = floor_dep_window(ts, dep_window)
+
+        dk = make_dep_key(dep_ws, rec, resource_depth, include_ip, include_app)
+        _update_dep_agg(dep_dict, dk, rec.get("event_ts", ""), rec, include_ip, include_app)
 
 
 # -------------------------
@@ -522,7 +585,9 @@ def _merge_agg_dicts(target, source):
 
 def process_file(file_path, event_q, summary_global, summary_lock,
                  dedup_minutes, progress, progress_lock, skip_nonjson,
-                 dep_global=None):
+                 dep_global=None, dep_window="daily", resource_depth=None,
+                 include_ip=False, include_app=False, filter_ops_set=None,
+                 skip_events=False):
     local_summary = {}
     local_dep = {} if dep_global is not None else None
 
@@ -546,8 +611,14 @@ def process_file(file_path, event_q, summary_global, summary_lock,
                 progress["filtered"] += 1
             continue
 
-        event_q.put(rec)
-        update_summary(local_summary, rec, dedup_minutes, dep_dict=local_dep)
+        if not skip_events:
+            event_q.put(rec)
+
+        update_summary(local_summary, rec, dedup_minutes,
+                       dep_dict=local_dep, dep_window=dep_window,
+                       resource_depth=resource_depth,
+                       include_ip=include_ip, include_app=include_app,
+                       filter_ops_set=filter_ops_set)
 
         with progress_lock:
             progress["events"] += 1
@@ -567,7 +638,6 @@ def write_summary_csv(summary, out_summary_path):
         w = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS)
         w.writeheader()
 
-        # sort keys for stable output
         for k in sorted(summary.keys()):
             agg = summary[k]
             w.writerow({
@@ -585,23 +655,40 @@ def write_summary_csv(summary, out_summary_path):
             })
 
 
-def write_dependency_csv(dep_dict, out_path):
+def write_dependency_csv(dep_dict, out_path, include_ip, include_app):
     with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=DEPENDENCY_ACCESS_FIELDS)
         w.writeheader()
         for k in sorted(dep_dict.keys()):
             agg = dep_dict[k]
-            service_raw = k[1]
+            idx = 0
+            window_start = k[idx]; idx += 1
+            service_raw  = k[idx]; idx += 1
+            user         = k[idx]; idx += 1
+            do_as        = k[idx]; idx += 1
+            op           = k[idx]; idx += 1
+            object_id    = k[idx]; idx += 1
+
+            if include_ip:
+                client_ip = k[idx]; idx += 1
+            else:
+                client_ip = agg.get("sample_ip", "")
+
+            if include_app:
+                app_name = k[idx]; idx += 1
+            else:
+                app_name = agg.get("sample_app", "")
+
             w.writerow({
-                "window_start": k[0],
+                "window_start": window_start,
                 "service": service_raw,
-                "user": k[2],
-                "do_as": k[3],
-                "client_ip": k[4],
-                "app_name": k[5],
-                "op": k[6],
+                "user": user,
+                "do_as": do_as,
+                "client_ip": client_ip,
+                "app_name": app_name,
+                "op": op,
                 "object_type": infer_object_type(service_raw),
-                "object_id": k[7],
+                "object_id": object_id,
                 "cnt": agg.get("cnt", 0),
             })
 
@@ -611,32 +698,74 @@ def main():
         description="Process Ranger audit logs from HDFS into events, summary, and dependency CSVs."
     )
     ap.add_argument("--hdfs-root", required=True, help="HDFS audit root, e.g. hdfs:///ranger/audit")
-    ap.add_argument("--out-events", required=True, help="Local output CSV path for per-event records")
+    ap.add_argument("--out-events", default=None,
+                    help="Output CSV for per-event records (omit or use --skip-events to skip)")
     ap.add_argument("--out-summary", required=True, help="Local output CSV path for dedup summary")
     ap.add_argument("--out-dependency", default=None,
-                    help="Optional: output CSV path for common-schema dependency_access (minimal fields)")
+                    help="Output CSV path for common-schema dependency_access (minimal fields)")
+    ap.add_argument("--skip-events", action="store_true", default=False,
+                    help="Skip writing the per-event CSV entirely (saves disk and I/O)")
     ap.add_argument("--threads", type=int, default=8,
                     help="Parallel threads across HDFS files (production: start with 2-4)")
-    ap.add_argument("--dedup-minutes", type=int, default=30, help="Dedup window minutes for summary tier")
+    ap.add_argument("--dedup-minutes", type=int, default=30,
+                    help="Dedup window minutes for summary tier (default: 30)")
 
-    # Date control (folder-based)
-    ap.add_argument("--since", default=None, help="Start date folder inclusive: YYYYMMDD")
-    ap.add_argument("--until", default=None, help="End date folder inclusive: YYYYMMDD")
-    ap.add_argument("--last-months", type=int, default=3, help="If --since/--until not provided, use last N months (default 3)")
+    dep_group = ap.add_argument_group("dependency output controls",
+                                      "Tune dependency CSV size and granularity")
+    dep_group.add_argument("--resource-depth", type=int, default=3,
+                           help="Truncate resource paths to this directory depth for dependency "
+                                "output (default: 3; e.g. /user/spark/data/). "
+                                "Set to 0 to use full parent directory (original behavior).")
+    dep_group.add_argument("--dep-window", default="daily",
+                           choices=["30m", "1h", "6h", "daily", "monthly", "none"],
+                           help="Time window granularity for dependency CSV "
+                                "(default: daily). 'none' = no time dimension, "
+                                "just first_seen/last_seen over entire range.")
+    dep_group.add_argument("--dep-include-ip", action="store_true", default=False,
+                           help="Include client_ip as a key dimension in dependency output "
+                                "(default: excluded to reduce cardinality)")
+    dep_group.add_argument("--dep-include-app", action="store_true", default=False,
+                           help="Include app_name as a key dimension in dependency output "
+                                "(default: excluded to reduce cardinality)")
+    dep_group.add_argument("--filter-ops", default=FILTER_OPS_DEFAULT,
+                           help="Comma-separated access types to EXCLUDE from dependency output "
+                                "(default: {}). These metadata operations inflate HDFS/Impala "
+                                "audit logs without adding dependency value. "
+                                "Set to empty string to disable filtering.".format(FILTER_OPS_DEFAULT))
 
-    # Scope
-    ap.add_argument("--services", default=None, help="Comma-separated services under audit root (e.g. hdfs,hive)")
-    ap.add_argument("--max-files", type=int, default=None, help="Optional cap on number of files to process")
-    ap.add_argument("--progress-every", type=int, default=200000, help="Print progress every N events")
-    ap.add_argument("--skip-nonjson", action="store_true", default=True, help="Skip lines that are not JSON objects")
+    date_group = ap.add_argument_group("date control (folder-based)")
+    date_group.add_argument("--since", default=None, help="Start date folder inclusive: YYYYMMDD")
+    date_group.add_argument("--until", default=None, help="End date folder inclusive: YYYYMMDD")
+    date_group.add_argument("--last-months", type=int, default=3,
+                            help="If --since/--until not provided, use last N months (default: 3)")
+
+    scope_group = ap.add_argument_group("scope")
+    scope_group.add_argument("--services", default=None,
+                             help="Comma-separated services under audit root (e.g. hdfs,hive)")
+    scope_group.add_argument("--max-files", type=int, default=None,
+                             help="Optional cap on number of files to process")
+    scope_group.add_argument("--progress-every", type=int, default=200000,
+                             help="Print progress every N events")
+    scope_group.add_argument("--skip-nonjson", action="store_true", default=True,
+                             help="Skip lines that are not JSON objects")
     args = ap.parse_args()
+
+    skip_events = args.skip_events or (args.out_events is None)
+
+    if not skip_events and args.out_events is None:
+        ap.error("--out-events is required unless --skip-events is set")
+
+    resource_depth = args.resource_depth if args.resource_depth > 0 else None
+
+    filter_ops_set = None
+    if args.filter_ops and args.filter_ops.strip():
+        filter_ops_set = set(op.strip().lower() for op in args.filter_ops.split(",") if op.strip())
 
     # Kerberos sanity
     rc, _, err = run_cmd(["hdfs", "dfs", "-ls", args.hdfs_root])
     if rc != 0:
         raise RuntimeError("Cannot access {}. Ensure kinit done.\n{}".format(args.hdfs_root, err.strip()))
 
-    # Determine date range for directory pruning
     if args.since or args.until:
         if not (args.since and args.until):
             raise SystemExit("If specifying date range, provide BOTH --since and --until in YYYYMMDD.")
@@ -661,29 +790,32 @@ def main():
         sys.exit(2)
 
     # ensure output dirs exist
-    out_events_dir = os.path.dirname(os.path.abspath(args.out_events)) or "."
-    out_summary_dir = os.path.dirname(os.path.abspath(args.out_summary)) or "."
-    if not os.path.exists(out_events_dir):
-        os.makedirs(out_events_dir)
-    if not os.path.exists(out_summary_dir):
-        os.makedirs(out_summary_dir)
+    for out_path in [args.out_events, args.out_summary, args.out_dependency]:
+        if out_path:
+            out_dir = os.path.dirname(os.path.abspath(out_path))
+            if out_dir and not os.path.exists(out_dir):
+                os.makedirs(out_dir)
 
-    # Shared summary dict + locks
     summary_global = {}
     dep_global = {} if args.out_dependency else None
     summary_lock = threading.Lock()
 
-    # Writer queue + thread
     event_q = queue.Queue(maxsize=50000)
     stop_evt = threading.Event()
-    wt = threading.Thread(target=writer_thread_fn, args=(event_q, args.out_events, stop_evt))
-    wt.daemon = True
-    wt.start()
+    wt = None
+
+    if not skip_events:
+        wt = threading.Thread(target=writer_thread_fn, args=(event_q, args.out_events, stop_evt))
+        wt.daemon = True
+        wt.start()
 
     progress = {"events": 0, "filtered": 0, "bad_json": 0, "progress_every": args.progress_every}
     progress_lock = threading.Lock()
 
-    print("Processing {} files with threads={}".format(len(files), args.threads), file=sys.stderr)
+    print("Processing {} files with threads={} skip_events={} dep_window={} resource_depth={} filter_ops={}".format(
+        len(files), args.threads, skip_events, args.dep_window,
+        resource_depth or "parent-dir", args.filter_ops or "none"
+    ), file=sys.stderr)
 
     try:
         with ThreadPoolExecutor(max_workers=args.threads) as ex:
@@ -700,15 +832,21 @@ def main():
                     progress_lock,
                     args.skip_nonjson,
                     dep_global,
+                    args.dep_window,
+                    resource_depth,
+                    args.dep_include_ip,
+                    args.dep_include_app,
+                    filter_ops_set,
+                    skip_events,
                 ))
             for fut in as_completed(futures):
                 fut.result()
 
-        # finish writer
-        event_q.put(None)
-        event_q.join()
-        stop_evt.set()
-        wt.join(60)
+        if not skip_events and wt is not None:
+            event_q.put(None)
+            event_q.join()
+            stop_evt.set()
+            wt.join(60)
 
         print("Writing summary CSV to {} (rows={:,})".format(args.out_summary, len(summary_global)), file=sys.stderr)
         write_summary_csv(summary_global, args.out_summary)
@@ -716,11 +854,22 @@ def main():
         if args.out_dependency and dep_global is not None:
             print("Writing dependency CSV to {} (rows={:,})".format(
                 args.out_dependency, len(dep_global)), file=sys.stderr)
-            write_dependency_csv(dep_global, args.out_dependency)
+            write_dependency_csv(dep_global, args.out_dependency,
+                                args.dep_include_ip, args.dep_include_app)
 
-        print("Done.\n  files={}\n  events={:,}\n  filtered={:,}\n  bad_json={:,}\n  events_csv={}\n  summary_csv={}".format(
-            len(files), progress["events"], progress["filtered"], progress["bad_json"], args.out_events, args.out_summary
-        ), file=sys.stderr)
+        parts = [
+            "Done.",
+            "  files={}".format(len(files)),
+            "  events={:,}".format(progress["events"]),
+            "  filtered={:,}".format(progress["filtered"]),
+            "  bad_json={:,}".format(progress["bad_json"]),
+            "  summary_csv={} ({:,} rows)".format(args.out_summary, len(summary_global)),
+        ]
+        if not skip_events:
+            parts.append("  events_csv={}".format(args.out_events))
+        if args.out_dependency and dep_global is not None:
+            parts.append("  dependency_csv={} ({:,} rows)".format(args.out_dependency, len(dep_global)))
+        print("\n".join(parts), file=sys.stderr)
 
     finally:
         try:
