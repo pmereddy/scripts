@@ -3,8 +3,11 @@
 """
 Python 3.6.8 compatible.
 Queries the Spark History Server REST API to list applications and produces
-a dependency_access CSV with minimal fields for the dependency model:
-  window_start, service, user, do_as, client_ip, app_name, op, object_type, object_id, cnt
+a dependency_access CSV with minimal fields for the dependency model.
+
+Spark 2.4 SHS does NOT support offset-based pagination.  This script uses
+date-window iteration (day by day) to collect all apps across a date range
+without hitting server-side result caps.
 """
 
 from __future__ import print_function
@@ -62,33 +65,58 @@ def ts_to_iso(ts_str):
     return ts_str[:19] + "Z" if len(ts_str) >= 19 else ts_str
 
 
-def fetch_apps(session, base_url, limit, sleep_ms, since_date, until_date):
-    """Fetch applications from Spark History Server with offset-based pagination.
+def fetch_one_window(session, url, min_date, max_date, limit):
+    """Fetch apps for a single date window. Returns list of app dicts."""
+    params = {"limit": limit}
+    if min_date:
+        params["minDate"] = min_date
+    if max_date:
+        params["maxDate"] = max_date
 
-    The SHS API supports `?start=N&limit=M` for pagination and returns a JSON
-    array.  We deduplicate by application ID to guard against edge cases.
+    resp = session.get(url, params=params, timeout=120)
+    if not resp.ok:
+        print("[spark] ERROR: HTTP {}: {}".format(resp.status_code, resp.text[:500]), file=sys.stderr)
+        return []
+
+    apps = resp.json()
+    if not isinstance(apps, list):
+        return []
+    return apps
+
+
+def fetch_apps(session, base_url, since_date, until_date, limit, sleep_ms):
+    """Fetch applications using day-by-day date windowing.
+
+    Spark 2.4 SHS ignores the 'start' offset parameter, so we iterate
+    one day at a time to ensure we collect all apps.
     """
     url = "{}/api/v1/applications".format(base_url.rstrip("/"))
     seen_ids = set()
     all_apps = []
-    start = 0
-    page = 0
 
-    while True:
-        params = {"limit": limit, "start": start}
-        if since_date:
-            params["minDate"] = since_date
-        if until_date:
-            params["maxDate"] = until_date
+    if not since_date:
+        apps = fetch_one_window(session, url, None, until_date, limit)
+        for app in apps:
+            app_id = app.get("id")
+            if app_id and app_id not in seen_ids:
+                seen_ids.add(app_id)
+                all_apps.append(app)
+        print("[spark] Fetched {} apps (no date range)".format(len(all_apps)), file=sys.stderr)
+        return all_apps
 
-        resp = session.get(url, params=params, timeout=120)
-        if not resp.ok:
-            print("ERROR: HTTP {}: {}".format(resp.status_code, resp.text[:2000]), file=sys.stderr)
-            sys.exit(1)
+    start = dt.datetime.strptime(since_date, "%Y-%m-%d")
+    if until_date:
+        end = dt.datetime.strptime(until_date, "%Y-%m-%d")
+    else:
+        end = dt.datetime.utcnow()
 
-        apps = resp.json()
-        if not isinstance(apps, list) or not apps:
-            break
+    day = start
+    day_count = 0
+    while day <= end:
+        day_str = day.strftime("%Y-%m-%d")
+        next_day_str = (day + dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+        apps = fetch_one_window(session, url, day_str, next_day_str, limit)
 
         new_count = 0
         for app in apps:
@@ -98,20 +126,19 @@ def fetch_apps(session, base_url, limit, sleep_ms, since_date, until_date):
                 all_apps.append(app)
                 new_count += 1
 
-        page += 1
-        print("[spark] page {} fetched={} new={} total={} start={}".format(
-            page, len(apps), new_count, len(all_apps), start
-        ), file=sys.stderr)
+        day_count += 1
+        if new_count > 0 or day_count % 7 == 0:
+            print("[spark] {} fetched={} new={} total={}".format(
+                day_str, len(apps), new_count, len(all_apps)), file=sys.stderr)
 
-        if len(apps) < limit:
-            break
+        if len(apps) >= limit:
+            print("[spark] WARNING: {} returned {} apps (= limit). "
+                  "Some apps may be missing for this day. "
+                  "Increase --limit if needed.".format(day_str, len(apps)), file=sys.stderr)
 
-        if new_count == 0:
-            print("[spark] WARNING: no new apps in page, stopping.", file=sys.stderr)
-            break
-
-        start += limit
-        time.sleep(sleep_ms / 1000.0)
+        day += dt.timedelta(days=1)
+        if sleep_ms > 0:
+            time.sleep(sleep_ms / 1000.0)
 
     return all_apps
 
@@ -134,10 +161,11 @@ def main():
                     help="End date YYYYMMDD for maxDate filter")
     ap.add_argument("--last-months", type=int, default=3,
                     help="If --since/--until not provided, fetch last N months (default: 3)")
-    ap.add_argument("--limit", type=int, default=500,
-                    help="Max apps per API request (default: 500)")
+    ap.add_argument("--limit", type=int, default=50000,
+                    help="Max apps per API request (default: 50000). "
+                         "Set high since SHS returns all matching apps in one call.")
     ap.add_argument("--sleep-ms", type=int, default=100,
-                    help="Sleep between paginated requests in ms (default: 100)")
+                    help="Sleep between daily requests in ms (default: 100)")
     ap.add_argument("--out-access", default="spark_access.csv",
                     help="Output CSV path (default: spark_access.csv)")
     args = ap.parse_args()
@@ -165,7 +193,8 @@ def main():
         since_date or "open", until_date or "open"
     ), file=sys.stderr)
 
-    apps = fetch_apps(session, args.shs_url, args.limit, args.sleep_ms, since_date, until_date)
+    apps = fetch_apps(session, args.shs_url, since_date, until_date,
+                      args.limit, args.sleep_ms)
     print("[spark] Total unique apps fetched: {}".format(len(apps)), file=sys.stderr)
 
     out_dir = os.path.dirname(os.path.abspath(args.out_access))
