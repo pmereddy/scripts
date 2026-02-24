@@ -2,20 +2,26 @@
 # -*- coding: utf-8 -*-
 """
 Python 3.6.8 compatible.
-Queries the CDSW Admin API (v1) to enumerate projects, jobs, sessions,
-models, and applications, and produces two CSVs compatible with load_neo4j.py:
+Queries the CDSW/CML Admin API (v1 or v2) to enumerate projects, jobs,
+sessions, models, and applications, and produces two CSVs compatible with
+load_neo4j.py:
 
   - dependency_objects CSV  (projects as CDPObjects)
   - dependency_access  CSV  (jobs/sessions/models as access events)
 
 Usage examples:
 
-  # Collect everything (API key auth)
+  # v2 API key (default) -- use this if you created a key from CDSW UI
   python3 cdsw_2_csv.py \\
       --cdsw-url https://cdsw.example.com \\
       --api-key <ADMIN_API_KEY> \\
       --out-objects cdsw_objects.csv \\
       --out-access  cdsw_access.csv
+
+  # v1 API (legacy)
+  python3 cdsw_2_csv.py \\
+      --cdsw-url https://cdsw.example.com \\
+      --api-key <V1_KEY> --api-version v1
 
   # Basic auth, limit to 50 projects
   python3 cdsw_2_csv.py \\
@@ -33,6 +39,7 @@ from __future__ import print_function
 
 import argparse
 import csv
+import json
 import os
 import sys
 import time
@@ -62,8 +69,12 @@ def mk_session(auth_mode, api_key, user, password, verify_tls):
     return s
 
 
-def paginate(session, url, key, page_size=100, sleep_ms=100, max_items=0):
-    """Generic paginated GET. Yields items from response[key]."""
+# ---------------------------------------------------------------------------
+# v1 pagination
+# ---------------------------------------------------------------------------
+
+def paginate_v1(session, url, key, page_size=100, sleep_ms=100, max_items=0):
+    """v1 API paginated GET. Yields items from response[key]."""
     offset = 0
     total = 0
     while True:
@@ -96,37 +107,112 @@ def paginate(session, url, key, page_size=100, sleep_ms=100, max_items=0):
             time.sleep(sleep_ms / 1000.0)
 
 
-def fetch_projects(session, base_url, page_size, sleep_ms, max_projects):
-    url = "{}/api/v1/projects".format(base_url)
-    projects = list(paginate(session, url, "projects",
-                             page_size=page_size, sleep_ms=sleep_ms,
-                             max_items=max_projects))
+# ---------------------------------------------------------------------------
+# v2 pagination
+# ---------------------------------------------------------------------------
+
+def paginate_v2(session, url, key, page_size=100, sleep_ms=100, max_items=0):
+    """v2 API paginated GET. Uses page_size / page_token params."""
+    page_token = ""
+    total = 0
+    while True:
+        params = {"page_size": page_size}
+        if page_token:
+            params["page_token"] = page_token
+        try:
+            resp = session.get(url, params=params, timeout=60)
+        except Exception as e:
+            print("[cdsw] ERROR fetching {}: {}".format(url, e), file=sys.stderr)
+            break
+        if not resp.ok:
+            print("[cdsw] HTTP {}: {} (url={})".format(
+                resp.status_code, resp.text[:300], url), file=sys.stderr)
+            break
+
+        data = resp.json()
+        items = data if isinstance(data, list) else data.get(key) or []
+        if not items:
+            break
+
+        for item in items:
+            yield item
+            total += 1
+            if 0 < max_items <= total:
+                return
+
+        if isinstance(data, list):
+            break
+        next_token = data.get("next_page_token") or ""
+        if not next_token or len(items) < page_size:
+            break
+        page_token = next_token
+        if sleep_ms > 0:
+            time.sleep(sleep_ms / 1000.0)
+
+
+# ---------------------------------------------------------------------------
+# Fetch helpers -- dispatch to v1 or v2
+# ---------------------------------------------------------------------------
+
+def fetch_projects(session, base_url, api_ver, page_size, sleep_ms,
+                   max_projects):
+    if api_ver == "v2":
+        url = "{}/api/v2/projects".format(base_url)
+        paginator = paginate_v2
+    else:
+        url = "{}/api/v1/projects".format(base_url)
+        paginator = paginate_v1
+    projects = list(paginator(session, url, "projects",
+                              page_size=page_size, sleep_ms=sleep_ms,
+                              max_items=max_projects))
     print("[cdsw] Fetched {} projects".format(len(projects)), file=sys.stderr)
     return projects
 
 
-def fetch_jobs(session, base_url, owner, project, page_size, sleep_ms):
-    url = "{}/api/v1/projects/{}/{}/jobs".format(base_url, owner, project)
-    return list(paginate(session, url, "jobs",
-                         page_size=page_size, sleep_ms=sleep_ms))
+def _sub_url(base_url, api_ver, proj, resource):
+    """Build URL for a project sub-resource (jobs, sessions, etc.)."""
+    if api_ver == "v2":
+        proj_id = proj.get("id") or proj.get("project_id") or ""
+        return "{}/api/v2/projects/{}/{}".format(base_url, proj_id, resource)
+    owner = _proj_owner(proj)
+    slug = proj.get("slug") or proj.get("name") or ""
+    return "{}/api/v1/projects/{}/{}/{}".format(base_url, owner, slug, resource)
 
 
-def fetch_sessions(session, base_url, owner, project, page_size, sleep_ms):
-    url = "{}/api/v1/projects/{}/{}/sessions".format(base_url, owner, project)
-    return list(paginate(session, url, "sessions",
-                         page_size=page_size, sleep_ms=sleep_ms))
+def _paginator(api_ver):
+    return paginate_v2 if api_ver == "v2" else paginate_v1
 
 
-def fetch_models(session, base_url, owner, project, page_size, sleep_ms):
-    url = "{}/api/v1/projects/{}/{}/models".format(base_url, owner, project)
-    return list(paginate(session, url, "models",
-                         page_size=page_size, sleep_ms=sleep_ms))
+def fetch_jobs(session, base_url, api_ver, proj, page_size, sleep_ms):
+    url = _sub_url(base_url, api_ver, proj, "jobs")
+    return list(_paginator(api_ver)(session, url, "jobs",
+                                    page_size=page_size, sleep_ms=sleep_ms))
 
 
-def fetch_applications(session, base_url, owner, project, page_size, sleep_ms):
-    url = "{}/api/v1/projects/{}/{}/applications".format(base_url, owner, project)
-    return list(paginate(session, url, "applications",
-                         page_size=page_size, sleep_ms=sleep_ms))
+def fetch_sessions(session, base_url, api_ver, proj, page_size, sleep_ms):
+    url = _sub_url(base_url, api_ver, proj, "sessions")
+    return list(_paginator(api_ver)(session, url, "sessions",
+                                    page_size=page_size, sleep_ms=sleep_ms))
+
+
+def fetch_models(session, base_url, api_ver, proj, page_size, sleep_ms):
+    url = _sub_url(base_url, api_ver, proj, "models")
+    return list(_paginator(api_ver)(session, url, "models",
+                                    page_size=page_size, sleep_ms=sleep_ms))
+
+
+def fetch_applications(session, base_url, api_ver, proj, page_size, sleep_ms):
+    url = _sub_url(base_url, api_ver, proj, "applications")
+    return list(_paginator(api_ver)(session, url, "applications",
+                                    page_size=page_size, sleep_ms=sleep_ms))
+
+
+def _proj_owner(proj):
+    """Extract owner username from v1 or v2 project dict."""
+    owner = proj.get("owner", {})
+    if isinstance(owner, dict):
+        return owner.get("username") or owner.get("name") or ""
+    return str(owner) if owner else ""
 
 
 def safe_ts(val):
@@ -141,15 +227,9 @@ def safe_ts(val):
 
 def project_id(proj):
     """Build a stable project identifier: owner/name."""
-    owner = proj.get("owner", {})
-    owner_name = owner.get("username") or owner.get("name") or "unknown"
+    owner_name = _proj_owner(proj) or "unknown"
     proj_name = proj.get("name") or proj.get("slug") or "unnamed"
     return "{}/{}".format(owner_name, proj_name)
-
-
-def project_owner(proj):
-    owner = proj.get("owner", {})
-    return owner.get("username") or owner.get("name") or ""
 
 
 def project_extra(proj):
@@ -175,6 +255,9 @@ def main():
                     help="CDSW base URL (e.g. https://cdsw.example.com)")
     ap.add_argument("--api-key", default="",
                     help="CDSW API key (admin key sees all projects)")
+    ap.add_argument("--api-version", choices=["v1", "v2"], default="v2",
+                    help="CDSW API version: v2 (default) for keys created in "
+                         "CDSW UI; v1 for legacy keys")
     ap.add_argument("--auth-mode", choices=["basic", "none"], default="none",
                     help="Auth mode if not using API key (default: none)")
     ap.add_argument("--user", default="", help="Username for basic auth")
@@ -205,10 +288,12 @@ def main():
         sys.exit(1)
 
     base_url = args.cdsw_url.rstrip("/")
+    api_ver = args.api_version
     session = mk_session(args.auth_mode, args.api_key,
                          args.user, args.password, args.verify_tls)
 
-    projects = fetch_projects(session, base_url, args.page_size,
+    print("[cdsw] Using API {} at {}".format(api_ver, base_url), file=sys.stderr)
+    projects = fetch_projects(session, base_url, api_ver, args.page_size,
                               args.sleep_ms, args.max_projects)
     if not projects:
         print("[cdsw] No projects found. Check URL and credentials.",
@@ -225,7 +310,7 @@ def main():
 
     for idx, proj in enumerate(projects):
         pid = project_id(proj)
-        owner = project_owner(proj)
+        owner = _proj_owner(proj)
 
         obj_rows.append({
             "service": "cdsw",
@@ -237,8 +322,7 @@ def main():
         })
 
         # --- Jobs (scheduled / manual) ---
-        jobs = fetch_jobs(session, base_url, owner,
-                          proj.get("slug") or proj.get("name") or "",
+        jobs = fetch_jobs(session, base_url, api_ver, proj,
                           args.page_size, args.sleep_ms)
         for job in jobs:
             job_name = job.get("name") or job.get("title") or ""
@@ -281,8 +365,7 @@ def main():
 
         # --- Sessions (interactive) ---
         if not args.skip_sessions:
-            sessions = fetch_sessions(session, base_url, owner,
-                                      proj.get("slug") or proj.get("name") or "",
+            sessions = fetch_sessions(session, base_url, api_ver, proj,
                                       args.page_size, args.sleep_ms)
             for sess in sessions:
                 sess_user = (sess.get("owner", {}).get("username") or
@@ -304,8 +387,7 @@ def main():
 
         # --- Models ---
         if not args.skip_models:
-            models = fetch_models(session, base_url, owner,
-                                  proj.get("slug") or proj.get("name") or "",
+            models = fetch_models(session, base_url, api_ver, proj,
                                   args.page_size, args.sleep_ms)
             for model in models:
                 model_name = model.get("name") or ""
@@ -335,8 +417,7 @@ def main():
         # --- Applications (web apps) ---
         if not args.skip_applications:
             cdsw_apps = fetch_applications(
-                session, base_url, owner,
-                proj.get("slug") or proj.get("name") or "",
+                session, base_url, api_ver, proj,
                 args.page_size, args.sleep_ms)
             for app in cdsw_apps:
                 app_name = app.get("name") or ""
