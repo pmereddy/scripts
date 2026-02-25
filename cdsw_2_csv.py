@@ -111,7 +111,8 @@ def paginate_v1(session, url, key, page_size=100, sleep_ms=100, max_items=0):
 # v2 pagination
 # ---------------------------------------------------------------------------
 
-def paginate_v2(session, url, key, page_size=100, sleep_ms=100, max_items=0):
+def paginate_v2(session, url, key, page_size=100, sleep_ms=100, max_items=0,
+                extra_params=None):
     """v2 API paginated GET. Uses page_size / page_token params."""
     page_token = ""
     total = 0
@@ -119,6 +120,8 @@ def paginate_v2(session, url, key, page_size=100, sleep_ms=100, max_items=0):
         params = {"page_size": page_size}
         if page_token:
             params["page_token"] = page_token
+        if extra_params:
+            params.update(extra_params)
         try:
             resp = session.get(url, params=params, timeout=60)
         except Exception as e:
@@ -158,13 +161,22 @@ def fetch_projects(session, base_url, api_ver, page_size, sleep_ms,
                    max_projects):
     if api_ver == "v2":
         url = "{}/api/v2/projects".format(base_url)
-        paginator = paginate_v2
+        # search_filter tells v2 API to include ALL projects (not just yours)
+        extra = {"search_filter": json.dumps({"include_public_projects": True})}
+        projects = list(paginate_v2(session, url, "projects",
+                                    page_size=page_size, sleep_ms=sleep_ms,
+                                    max_items=max_projects,
+                                    extra_params=extra))
+        if not projects:
+            print("[cdsw] Retrying without search_filter...", file=sys.stderr)
+            projects = list(paginate_v2(session, url, "projects",
+                                        page_size=page_size, sleep_ms=sleep_ms,
+                                        max_items=max_projects))
     else:
         url = "{}/api/v1/projects".format(base_url)
-        paginator = paginate_v1
-    projects = list(paginator(session, url, "projects",
-                              page_size=page_size, sleep_ms=sleep_ms,
-                              max_items=max_projects))
+        projects = list(paginate_v1(session, url, "projects",
+                                    page_size=page_size, sleep_ms=sleep_ms,
+                                    max_items=max_projects))
     print("[cdsw] Fetched {} projects".format(len(projects)), file=sys.stderr)
     return projects
 
